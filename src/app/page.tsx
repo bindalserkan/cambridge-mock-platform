@@ -41,13 +41,18 @@ export default function Home() {
       .from('teachers')
       .select('id, name, email')
       .eq('email', userEmail)
-      .single(); // Expecting exactly one record
+      .maybeSingle(); // Changed from .single() to handle 0 rows gracefully
 
     if (error) {
       console.error('Backend Error [Profile Mapping]:', error.message);
     } else if (data) {
+      // If a matching teacher profile exists in PostgreSQL
       setCurrentTeacher(data);
       await fetchExamsForTeacher(data.id);
+    } else {
+      // If user is authenticated in Auth but has no profile record in 'teachers' table
+      console.warn(`Authenticated user ${userEmail} has no matching record in teachers table.`);
+      setCurrentTeacher(null);
     }
   };
 
