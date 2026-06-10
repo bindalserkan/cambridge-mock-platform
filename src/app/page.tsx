@@ -1,67 +1,221 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { supabase } from '@/app/lib/supabaseClient';
+import { useRouter, useSearchParams } from 'next/navigation'; // GÜNCELLENDİ: useSearchParams eklendi
+import { supabase } from '@/lib/supabaseClient';
+import { StudentExamInput, ExamType } from '@/lib/examEngine/types';
+import { generateDoorListHTML, generateAttendanceListHTML, generateFinalReportHTML } from '@/components/print/PrintTemplates';
+
+interface Profile {
+  id: string;
+  username: string;
+  email: string;
+  role: 'admin' | 'teacher';
+}
+
+interface Exam {
+  id: number;
+  name: string;
+}
+
+interface Student {
+  id: string;
+  name: string;
+  writing_score: number | null;
+  speaking_score: number | null;
+  status: string;
+  raw_scores?: any;
+}
 
 export default function Home() {
-  // Authentication & RBAC States
+  const router = useRouter();
+  const searchParams = useSearchParams(); // EKLENDİ: URL parametrelerini okuma motoru
+  const examIdParam = searchParams.get('examId'); // EKLENDİ: URL'deki ?examId= değerini yakalar
+
+  // Authentication & Session States
   const [sessionUser, setSessionUser] = useState<any>(null);
   const [email, setEmail] = useState<string>('');
   const [password, setPassword] = useState<string>('');
   const [authError, setAuthError] = useState<string | null>(null);
-  const [currentProfile, setCurrentProfile] = useState<any>(null);
+  const [currentProfile, setCurrentProfile] = useState<Profile | null>(null);
 
-  // Structural Data States
-  const [allExams, setAllExams] = useState<any[]>([]);
-  const [activeStudents, setActiveStudents] = useState<any[]>([]);
+  // Design Consistent Validation Error States
+  const [emailValidationError, setEmailValidationError] = useState<string | null>(null);
+  const [studentValidationError, setStudentValidationError] = useState<string | null>(null);
+  const [examValidationError, setExamValidationError] = useState<string | null>(null);
+
+  // Global Content States
+  const [allExams, setAllExams] = useState<Exam[]>([]);
+  const [activeStudents, setActiveStudents] = useState<Student[]>([]);
   const [selectedExamId, setSelectedExamId] = useState<string | null>(null);
 
-  // Form Inputs & Explicit Queue-Based Registration System
-  const [newExamName, setNewExamName] = useState<string>('');
-  const [newExamLevel, setNewExamLevel] = useState<string>('B2');
+  // Exam Generation Sequence States
+  const [buildType, setBuildType] = useState<string>('');
+  const [buildYear, setBuildYear] = useState<string>('');
+  const [buildMonth, setBuildMonth] = useState<string>('');
+
+  // Candidate Registration Interface States
   const [studentInput, setStudentInput] = useState<string>('');
   const [pendingStudents, setPendingStudents] = useState<string[]>([]);
   const [targetExamId, setTargetExamId] = useState<string>('');
+  const [existingStudentsInTarget, setExistingStudentsInTarget] = useState<string[]>([]);
 
-  // UI Status & Custom Toast Notification System
+  // Destructive Action Modal Control State
+  const [deleteTarget, setDeleteTarget] = useState<{
+    type: 'exam' | 'student';
+    id: number | string;
+    name: string;
+  } | null>(null);
+
+  // UI Status Flag Identifiers
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
-  // Custom Toast Trigger Function
+  // Dynamic Time Engine Constants
+  const currentYear = new Date().getFullYear();
+  const availableYears = [String(currentYear), String(currentYear + 1)];
+  const allMonths = [
+    'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+    'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'
+  ];
+
   const showNotification = (message: string, type: 'success' | 'error' = 'success') => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 3500);
   };
 
+  const handleEmailBlur = () => {
+    if (email.length === 0) {
+      setEmailValidationError(null);
+      return;
+    }
+    const corporateEmailPattern = /^[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\@scaleflow\.com$/;
+    if (!corporateEmailPattern.test(email)) {
+      setEmailValidationError('Please follow this structure: your username.institution@scaleflow.com');
+    } else {
+      setEmailValidationError(null);
+    }
+  };
+
+  const handleEmailFocus = () => setEmailValidationError(null);
+
+  // Optimized Unified Print Orchestrators
+  const executePrint = (htmlContent: string) => {
+    const printWindow = window.open('', '_blank');
+    if (!printWindow) return;
+    printWindow.document.write(htmlContent);
+    printWindow.document.close();
+  };
+
+  const printDoorList = () => {
+    const currentExam = allExams.find(e => String(e.id) === selectedExamId); // Küçük düzeltme: undefined hatasını önlemek için güvenli tanım
+    if (!currentExam) return;
+    const html = generateDoorListHTML({ examName: currentExam.name, students: activeStudents });
+    executePrint(html);
+  };
+
+  const printAttendanceList = () => {
+    const currentExam = allExams.find(e => String(e.id) === selectedExamId); // Küçük düzeltme
+    if (!currentExam) return;
+    const html = generateAttendanceListHTML({ examName: currentExam.name, students: activeStudents });
+    executePrint(html);
+  };
+
+  // EKLENDİ: URL köprüsünü kuran hayati gözcü. Geri butonuna basıldığında tetiklenir.
   useEffect(() => {
-    async function checkActiveSession() {
-      setIsLoading(true);
-      const { data: { session } } = await supabase.auth.getSession();
+    if (examIdParam) {
+      setSelectedExamId(examIdParam);
+    }
+  }, [examIdParam]);
+
+  // Asynchronously fetch existing student ledger names whenever target exam changes
+  useEffect(() => {
+    if (!targetExamId) {
+      setExistingStudentsInTarget([]);
+      return;
+    }
+    async function loadTargetRosterNames() {
+      const { data } = await supabase
+        .from('students')
+        .select('name')
+        .eq('exam_id', Number(targetExamId));
+      if (data) {
+        setExistingStudentsInTarget(data.map(s => s.name.trim().toLowerCase()));
+      }
+    }
+    loadTargetRosterNames();
+  }, [targetExamId]);
+
+  // Reactive Validation Engine for Exam Generation Duplicates
+  useEffect(() => {
+    if (!buildType || !buildYear || !buildMonth) {
+      setExamValidationError(null);
+      return;
+    }
+    const concatenatedName = `${buildType} ${buildYear} ${buildMonth}`.trim().toLowerCase();
+    const isDuplicate = allExams.some(exam => exam.name.trim().toLowerCase() === concatenatedName);
+    if (isDuplicate) {
+      setExamValidationError('An active exam session with this configuration already exists.');
+    } else {
+      setExamValidationError(null);
+    }
+  }, [buildType, buildYear, buildMonth, allExams]);
+
+  // Unified Reactive Validation Engine for Candidate Input
+  useEffect(() => {
+    const trimmed = studentInput.trim().toLowerCase();
+    if (!trimmed) {
+      setStudentValidationError(null);
+      return;
+    }
+    const isDuplicateInQueue = pendingStudents.some(name => name.toLowerCase() === trimmed);
+    const isDuplicateInDatabase = existingStudentsInTarget.includes(trimmed);
+
+    if (isDuplicateInQueue) {
+      setStudentValidationError('Candidate already exists in the registry queue.');
+    } else if (isDuplicateInDatabase) {
+      setStudentValidationError('Candidate already registered in this specific session.');
+    } else {
+      setStudentValidationError(null);
+    }
+  }, [studentInput, pendingStudents, existingStudentsInTarget]);
+
+  // Unified Live Authentication Lifecycle Listener
+  useEffect(() => {
+    setIsLoading(true);
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
       if (session?.user) {
         setSessionUser(session.user);
-        await fetchUserProfile(session.user.email!);
+        const { data: profileData } = await supabase
+          .from('profiles')
+          .select('id, username, email, role')
+          .eq('email', session.user.email!)
+          .maybeSingle();
+
+        if (profileData) {
+          setCurrentProfile(profileData as Profile);
+          setAuthError(null);
+          const { data: exams } = await supabase.from('exams').select('id, name').order('id', { ascending: false });
+          if (exams) setAllExams(exams);
+        } else {
+          setAuthError('Profile record missing in cloud workspace ledger.');
+          setCurrentProfile(null);
+        }
+      } else {
+        setSessionUser(null);
+        setCurrentProfile(null);
+        setSelectedExamId(null);
+        setAllExams([]);
+        setActiveStudents([]);
+        setAuthError(null);
       }
       setIsLoading(false);
-    }
-    checkActiveSession();
+    });
+    return () => subscription.unsubscribe();
   }, []);
 
-  const fetchUserProfile = async (userEmail: string) => {
-    const { data } = await supabase.from('profiles').select('id, name, email, role').eq('email', userEmail).maybeSingle();
-    if (data) {
-      setCurrentProfile(data);
-      await loadGlobalData();
-    }
-  };
-
-  const loadGlobalData = async () => {
-    setIsLoading(true);
-    const { data: exams } = await supabase.from('exams').select('id, name, level').order('id', { ascending: false });
-    if (exams) setAllExams(exams);
-    setIsLoading(false);
-  };
-
+  // Syncs candidate lists reactively whenever a target exam context is loaded
   useEffect(() => {
     if (!selectedExamId) {
       setActiveStudents([]);
@@ -69,8 +223,12 @@ export default function Home() {
     }
     async function fetchStudents() {
       setIsLoading(true);
-      const { data } = await supabase.from('students').select('id, name, writing_score, speaking_score, status').eq('exam_id', selectedExamId).order('name', { ascending: true });
-      if (data) setActiveStudents(data);
+      const { data } = await supabase
+        .from('students')
+        .select('id, name, writing_score, speaking_score, status, raw_scores')
+        .eq('exam_id', selectedExamId)
+        .order('name', { ascending: true });
+      if (data) setActiveStudents(data as Student[]);
       setIsLoading(false);
     }
     fetchStudents();
@@ -78,407 +236,379 @@ export default function Home() {
 
   const handleCreateExam = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newExamName) return;
+    if (!buildType || !buildYear || !buildMonth || examValidationError) return;
+    const concatenatedName = `${buildType} ${buildYear} ${buildMonth}`;
+
     setIsSaving(true);
-    const { error } = await supabase.from('exams').insert({ name: newExamName, level: newExamLevel });
+    const { error } = await supabase.from('exams').insert({ name: concatenatedName });
     if (error) {
       showNotification(error.message, 'error');
     } else {
-      setNewExamName('');
-      await loadGlobalData();
-      showNotification('New exam session successfully published to the pool.');
+      const { data: exams } = await supabase.from('exams').select('id, name').order('id', { ascending: false });
+      if (exams) setAllExams(exams);
+      showNotification(`Session added successfully: ${concatenatedName}`);
+      setBuildType('');
+      setBuildYear('');
+      setBuildMonth('');
     }
     setIsSaving(false);
   };
 
-  // EXPLICIT PLUS BUTTON TRIGGER (Appends named candidate to the local staging array)
+  const executeConfirmedDeletion = async () => {
+    if (!deleteTarget) return;
+    setIsSaving(true);
+
+    if (deleteTarget.type === 'exam') {
+      const { error } = await supabase.from('exams').delete().eq('id', deleteTarget.id);
+      if (error) {
+        showNotification(error.message, 'error');
+      } else {
+        setAllExams(prev => prev.filter(e => e.id !== deleteTarget.id));
+        showNotification(`Exam session "${deleteTarget.name}" deleted.`);
+      }
+    } else if (deleteTarget.type === 'student') {
+      const { error } = await supabase.from('students').delete().eq('id', deleteTarget.id);
+      if (error) {
+        showNotification(error.message, 'error');
+      } else {
+        setActiveStudents(prev => prev.filter(s => s.id !== deleteTarget.id));
+        showNotification(`Candidate "${deleteTarget.name}" removed from session.`);
+        if (targetExamId) {
+          const { data } = await supabase.from('students').select('name').eq('exam_id', Number(targetExamId));
+          if (data) setExistingStudentsInTarget(data.map(s => s.name.trim().toLowerCase()));
+        }
+      }
+    }
+    setIsSaving(false);
+    setDeleteTarget(null);
+  };
+
   const addStudentToQueue = () => {
     const trimmed = studentInput.trim();
-    if (!trimmed) return;
-    
-    if (pendingStudents.includes(trimmed)) {
-      showNotification('This student name is already in your staging list.', 'error');
-      return;
-    }
-
+    if (!trimmed || studentValidationError) return;
     setPendingStudents([...pendingStudents, trimmed]);
     setStudentInput('');
   };
 
-  const removePendingStudent = (indexToRemove: number) => {
-    setPendingStudents(pendingStudents.filter((_, idx) => idx !== indexToRemove));
-  };
-
-  // BULK DATABASE INJECTION OVER COHORT STAGING ARRAY
-  const handleDeployStagedRoster = async (e: React.FormEvent) => {
+  const handleDeployRoster = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (pendingStudents.length === 0 || !targetExamId) {
-      showNotification('Staging area is empty or target session is unselected.', 'error');
-      return;
-    }
+    if (studentValidationError || !targetExamId) return;
+
+    let finalRoster = [...pendingStudents];
+    const directInput = studentInput.trim();
+    if (directInput && !finalRoster.includes(directInput)) finalRoster.push(directInput);
+
+    if (finalRoster.length === 0) return;
     setIsSaving(true);
 
-    const payload = pendingStudents.map(studentName => ({
-      name: studentName,
-      exam_id: Number(targetExamId)
-    }));
-
+    const payload = finalRoster.map(name => ({ name, exam_id: Number(targetExamId) }));
     const { error } = await supabase.from('students').insert(payload);
 
     if (error) {
       showNotification(error.message, 'error');
     } else {
-      const deployedCount = pendingStudents.length;
+      const candidateCount = finalRoster.length;
       setPendingStudents([]);
       setStudentInput('');
-      
-      if (String(targetExamId) === String(selectedExamId)) {
-        setSelectedExamId(null);
-        setTimeout(() => setSelectedExamId(targetExamId), 50);
-      }
-      showNotification(`Successfully deployed ${deployedCount} students to the secure institutional database.`);
+      setTargetExamId('');
+      setExistingStudentsInTarget([]);
+      showNotification(`Registered ${candidateCount} ${candidateCount === 1 ? 'candidate' : 'candidates'} successfully.`);
     }
     setIsSaving(false);
   };
 
-  const handleScoreChange = (studentId: string, field: 'writing_score' | 'speaking_score', value: string) => {
-    if (currentProfile?.role === 'admin') return; 
-    if (value !== '' && (isNaN(Number(value)) || Number(value) < 0 || Number(value) > 20)) return;
-    
-    setActiveStudents(prev => prev.map(s => {
-      if (s.id === studentId) {
-        const updated = { ...s, [field]: value };
-        updated.status = updated.writing_score && updated.speaking_score ? 'Graded' : 'Pending';
-        return updated;
-      }
-      return s;
-    }));
-  };
-
-  const handleSyncSession = async () => {
-    if (currentProfile?.role === 'admin') return;
-    setIsSaving(true);
-    for (const student of activeStudents) {
-      await supabase.from('students').update({
-        writing_score: student.writing_score,
-        speaking_score: student.speaking_score,
-        status: student.status
-      }).eq('id', student.id);
+  const toggleAttendance = async (studentId: string, currentStatus: string) => {
+    const nextStatus = currentStatus === 'Absent' ? 'Pending' : 'Absent';
+    const { error } = await supabase.from('students').update({ status: nextStatus }).eq('id', studentId);
+    if (!error) {
+      setActiveStudents(prev => prev.map(s => s.id === studentId ? { ...s, status: nextStatus as any } : s));
     }
-    setIsSaving(false);
-    showNotification('Assessment data successfully synced with the cloud database.');
   };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (emailValidationError) return;
     setIsLoading(true);
     setAuthError(null);
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) { 
-      setAuthError(error.message); 
-      setIsLoading(false); 
-    } else if (data?.user) { 
-      setSessionUser(data.user); 
-      await fetchUserProfile(data.user.email!); 
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) {
+      setAuthError(error.message);
+      setIsLoading(false);
     }
   };
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
-    setSessionUser(null);
-    setCurrentProfile(null);
-    setSelectedExamId(null);
     setEmail('');
     setPassword('');
-    setStudentInput('');
-    setPendingStudents([]);
-  };
-
-  const triggerPrint = () => {
-    window.print();
+    setEmailValidationError(null);
+    setStudentValidationError(null);
+    setExamValidationError(null);
+    setBuildType('');
+    setBuildYear('');
+    setBuildMonth('');
+    setTargetExamId('');
   };
 
   const currentExam = allExams.find(e => String(e.id) === String(selectedExamId));
-  const gradedCount = activeStudents.filter(s => s.status === 'Graded').length;
-  const totalStudents = activeStudents.length;
+  const isExamFormIncomplete = !buildType || !buildYear || !buildMonth;
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans antialiased flex justify-center print:bg-white print:p-0">
-      
-      {/* GLOBAL TOAST NOTIFICATION CONTAINER */}
+    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans antialiased flex justify-center selection:bg-indigo-100">
+
+      {/* Toast Notification */}
       {toast && (
-        <div className={`fixed top-4 max-w-sm w-full mx-4 shadow-xl rounded-2xl p-4 z-50 text-white font-semibold flex items-center gap-3 transition-all ${toast.type === 'success' ? 'bg-emerald-600' : 'bg-rose-600'}`}>
-          <span>{toast.type === 'success' ? '✓' : '⚠️'}</span>
-          <p className="text-xs tracking-wide">{toast.message}</p>
+        <div className={`fixed top-5 left-1/2 -translate-x-1/2 z-50 w-80 shadow-xl rounded-2xl p-3.5 border text-xs font-bold tracking-tight backdrop-blur-md transition-all flex items-center gap-2.5 animate-in fade-in slide-in-from-top-4 duration-300 ${toast.type === 'success' ? 'bg-emerald-50/95 border-emerald-100 text-emerald-950' : 'bg-rose-50/95 border-rose-100 text-rose-950'
+          }`}>
+          <span className="text-sm">{toast.type === 'success' ? '✨' : '⚠️'}</span>
+          <div className="flex-1 font-medium">{toast.message}</div>
         </div>
       )}
 
-      {/* PRINT-READY DOOR ATTENDANCE MATRIX */}
-      <div className="hidden print:block w-full p-8 space-y-6">
-        <div className="border-b-2 border-slate-900 pb-4 text-center space-y-1">
-          <h1 className="text-2xl font-black tracking-wider uppercase text-slate-900">ScaleFlow Mock Examination</h1>
-          <p className="text-sm font-bold text-slate-600">Exam Attendance & Door Roster</p>
+      {/* Deletion Modal */}
+      {deleteTarget && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-white w-full max-w-xs rounded-2xl p-5 shadow-2xl border border-slate-100 space-y-4 animate-in zoom-in-95 duration-200">
+            <div className="mx-auto w-10 h-10 bg-rose-50 rounded-full flex items-center justify-center text-rose-600 font-bold text-lg">⚠️</div>
+            <div className="text-center space-y-1">
+              <h4 className="text-sm font-black text-slate-900 tracking-tight">Delete {deleteTarget.type === 'exam' ? 'Exam Session' : 'Candidate'}?</h4>
+              <p className="text-[11px] text-slate-500 font-medium leading-relaxed px-2">
+                {deleteTarget.type === 'exam' ? (
+                  <>Candidate(s) registered to <span className="font-bold text-slate-800">"{deleteTarget.name}"</span> will also be removed.</>
+                ) : (
+                  <>Are you sure you want to permanently remove <span className="font-bold text-slate-800">"{deleteTarget.name}"</span> from this roster?</>
+                )}
+              </p>
+            </div>
+            <div className="flex gap-2 pt-1.5">
+              <button onClick={() => setDeleteTarget(null)} disabled={isSaving} className="flex-1 bg-slate-100 text-slate-700 text-xs font-bold py-2.5 rounded-xl active:scale-95 transition-all">Cancel</button>
+              <button onClick={executeConfirmedDeletion} disabled={isSaving} className="flex-1 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold py-2.5 rounded-xl active:scale-95 transition-all shadow-xs">
+                {isSaving ? 'Deleting...' : 'Delete'}
+              </button>
+            </div>
+          </div>
         </div>
-        <div className="grid grid-cols-2 gap-4 text-sm font-bold bg-slate-100 p-3 rounded-lg border border-slate-200">
-          <div>Exam Session: <span className="font-normal text-slate-700">{currentExam?.name}</span></div>
-          <div className="text-right">Level / Type: <span className="font-normal text-slate-700">{currentExam?.level}</span></div>
-        </div>
-        <table className="w-full border-collapse border border-slate-300 text-sm">
-          <thead>
-            <tr className="bg-slate-200 text-slate-800">
-              <th className="border border-slate-300 p-2.5 text-left w-12">No</th>
-              <th className="border border-slate-300 p-2.5 text-left">Student Full Name</th>
-              <th className="border border-slate-300 p-2.5 text-center w-32">Signature</th>
-              <th className="border border-slate-300 p-2.5 text-center w-32">Remarks</th>
-            </tr>
-          </thead>
-          <tbody>
-            {activeStudents.map((student, idx) => (
-              <tr key={student.id} className="hover:bg-slate-50">
-                <td className="border border-slate-300 p-2.5 font-mono text-center">{idx + 1}</td>
-                <td className="border border-slate-300 p-2.5 font-bold uppercase">{student.name}</td>
-                <td className="border border-slate-300 p-2.5"></td>
-                <td className="border border-slate-300 p-2.5 text-xs text-slate-400 text-center">Cambridge Format</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        <div className="pt-12 grid grid-cols-2 text-xs font-bold text-slate-400">
-          <div>Date Generated: {new Date().toLocaleDateString('en-US')}</div>
-          <div>ScaleFlow Institutional Management Systems</div>
-        </div>
-      </div>
+      )}
 
-      {/* MAIN SCREEN APPLICATION FRAME */}
-      <div className="w-full max-w-md bg-white shadow-xl min-h-screen flex flex-col relative border-x border-slate-100 print:hidden">
-        
-        {/* Sticky Header */}
-        <header className="p-4 border-b border-slate-100 bg-white sticky top-0 z-10 flex items-center justify-between">
+      <div className="w-full max-w-md bg-white shadow-xl min-h-screen flex flex-col border-x border-slate-100">
+        <header className="p-4 border-b border-slate-100 flex items-center justify-between sticky top-0 bg-white z-10">
           {selectedExamId ? (
-            <button onClick={() => setSelectedExamId(null)} className="text-xs font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 rounded-xl cursor-pointer">
-              ← Back to Exam Pool
-            </button>
+            <button onClick={() => { setSelectedExamId(null); router.push('/'); }} className="text-xs font-bold text-slate-900 bg-slate-50 px-3 py-1.5 rounded-xl">← Sessions</button>
           ) : (
             <div>
-              <h1 className="text-xl font-bold tracking-tight text-indigo-600">ScaleFlow</h1>
-              <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-tight">Mock Exam Management & Assessment Matrix</p>
+              <h1 className="text-xl font-black tracking-tight text-slate-900">ScaleFlow</h1>
+              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Assessment Hub</p>
             </div>
           )}
-          <div className="flex items-center gap-2">
-            {sessionUser && (
-              <button onClick={handleLogout} className="text-[11px] font-bold text-rose-600 bg-rose-50 px-2 py-1 rounded-md cursor-pointer">
-                Sign Out
-              </button>
-            )}
-            <span className={`h-2.5 w-2.5 rounded-full ${isLoading || isSaving ? 'bg-amber-500 animate-bounce' : 'bg-emerald-500 animate-pulse'}`}></span>
-          </div>
+          {sessionUser && <button onClick={handleLogout} className="text-[11px] font-bold text-rose-600 bg-rose-50 px-2 py-1 rounded-md">Sign Out</button>}
         </header>
 
         <main className="p-4 flex-1 pb-24">
-          {!sessionUser ? (
-            /* Gateway Login Form */
+          {isLoading ? (
+            <div className="text-center pt-12 text-xs font-bold text-slate-400 uppercase tracking-widest animate-pulse">Loading Portal...</div>
+          ) : !sessionUser ? (
             <form onSubmit={handleLogin} className="space-y-4 pt-12">
-              <div className="text-center space-y-1.5 mb-8">
-                <h2 className="text-xl font-black text-slate-900 tracking-tight">ScaleFlow Corporate Login Portal</h2>
-                <p className="text-xs text-slate-400 max-w-[280px] mx-auto">Secure assessment, grading, and administrative management infrastructure.</p>
+              <div className="text-center mb-8">
+                <h2 className="text-xl font-black text-slate-900 tracking-tight">ScaleFlow Hub</h2>
+                <p className="text-xs text-slate-500 font-medium mt-1">Sign in to your coordinator or teacher account</p>
               </div>
-              {authError && <div className="bg-rose-50 border border-rose-100 text-rose-700 text-xs font-semibold p-3 rounded-xl text-center">{authError}</div>}
-              <div>
-                <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1 tracking-wider">Email Address</label>
-                <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white transition-all" placeholder="name@school.com" />
+              {authError && <div className="text-rose-600 text-xs text-center font-bold bg-rose-50 p-2.5 rounded-xl border border-rose-100">{authError}</div>}
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block px-0.5">Email</label>
+                <input
+                  type="email" required value={email} onChange={(e) => setEmail(e.target.value)} onBlur={handleEmailBlur} onFocus={handleEmailFocus}
+                  className={`w-full bg-slate-50 border p-2.5 rounded-xl text-sm transition-all focus:bg-white focus:ring-2 ${emailValidationError ? 'border-rose-400 focus:ring-rose-100 bg-rose-50/10 text-rose-900' : 'border-slate-200 focus:ring-slate-900'}`}
+                  placeholder="username.institution@scaleflow.com"
+                />
+                {emailValidationError && <div className="text-rose-500 text-[11px] font-medium px-1 pt-0.5">{emailValidationError}</div>}
               </div>
-              <div>
-                <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1 tracking-wider">Password</label>
-                <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white transition-all" placeholder="••••••••" />
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block px-0.5">Password</label>
+                <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} className="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-slate-900" placeholder="••••••••" />
               </div>
-              <button type="submit" disabled={isLoading} className="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold text-sm py-3 rounded-xl shadow-md cursor-pointer transition-all mt-2">
-                {isLoading ? 'Verifying...' : 'Secure Sign In'}
-              </button>
+              <button type="submit" disabled={!!emailValidationError} className="w-full bg-slate-900 disabled:bg-slate-300 text-white font-bold py-3 rounded-xl text-sm transition-all shadow-md mt-2">Sign In to Portal</button>
             </form>
           ) : (
             <>
-              {/* VIEWPORT 1: Global Exam Selection Pool */}
               {!selectedExamId ? (
                 <div className="space-y-6">
-                  {/* Dynamic Role Banner */}
-                  <div className={`rounded-2xl p-4 border ${currentProfile?.role === 'admin' ? 'bg-amber-50/60 border-amber-200/60' : 'bg-indigo-50/60 border-indigo-100/60'}`}>
-                    <span className={`text-[9px] font-black tracking-widest text-white px-2 py-0.5 rounded-md uppercase ${currentProfile?.role === 'admin' ? 'bg-amber-600' : 'bg-indigo-600'}`}>
-                      {currentProfile?.role === 'admin' ? 'Administrative Staff / Coordinator' : 'Academic Evaluator'}
-                    </span>
-                    <h3 className="text-base font-bold text-slate-900 mt-1.5">Welcome, {currentProfile?.name}</h3>
-                    <p className="text-xs text-slate-500">Connected to the centralized institutional exam pool.</p>
+                  <div className="bg-slate-900 text-white rounded-2xl p-5 shadow-lg relative overflow-hidden">
+                    <span className="text-[9px] bg-indigo-600 text-white px-2 py-0.5 rounded uppercase font-black tracking-wider">{currentProfile?.role === 'admin' ? 'COORDINATOR ACCOUNT' : 'TEACHER ACCOUNT'}</span>
+                    <h3 className="text-lg font-black mt-1.5 tracking-tight">Welcome, {currentProfile?.username || 'Academic Evaluator'}</h3>
                   </div>
 
-                  {/* ADMIN ONLY: Generation Control Blocks */}
                   {currentProfile?.role === 'admin' && (
-                    <div className="space-y-4 border-b border-slate-100 pb-6">
-                      {/* Form A: Deploy Exam */}
-                      <form onSubmit={handleCreateExam} className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3 shadow-xs">
-                        <h4 className="text-xs font-black uppercase text-slate-400 tracking-wider">Define New Exam Session</h4>
+                    <div className="space-y-4 border-b pb-6">
+                      <form onSubmit={handleCreateExam} className="border rounded-2xl p-4 space-y-3 bg-slate-50">
+                        <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider block">Generate New Session</span>
+                        {examValidationError && <div className="text-rose-500 text-[11px] font-medium px-1 transition-all">{examValidationError}</div>}
                         <div className="grid grid-cols-3 gap-2">
-                          <input type="text" required placeholder="Session Name (e.g., FCE Mock)" value={newExamName} onChange={(e) => setNewExamName(e.target.value)} className="col-span-2 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs focus:outline-none focus:bg-white" />
-                          <select value={newExamLevel} onChange={(e) => setNewExamLevel(e.target.value)} className="bg-slate-50 border border-slate-200 rounded-xl px-2 py-2 text-xs focus:outline-none font-bold">
-                            <option value="A2">A2</option>
-                            <option value="B1">B1</option>
-                            <option value="B2">B2</option>
-                            <option value="C1">C1</option>
+                          <select value={buildType} onChange={(e) => setBuildType(e.target.value)} className={`bg-white border p-2 rounded-xl text-xs font-bold transition-all focus:ring-2 focus:ring-slate-900 ${examValidationError ? 'border-rose-400 bg-rose-50/10' : 'border-slate-200'}`}>
+                            <option value="">Type...</option>
+                            {['KET', 'PET', 'FCE', 'CAE', 'CPE'].map(t => <option key={t} value={t}>{t}</option>)}
+                          </select>
+                          <select value={buildYear} onChange={(e) => setBuildYear(e.target.value)} className={`bg-white border p-2 rounded-xl text-xs font-bold transition-all focus:ring-2 focus:ring-slate-900 ${examValidationError ? 'border-rose-400 bg-rose-50/10' : 'border-slate-200'}`}>
+                            <option value="">Year...</option>
+                            {availableYears.map(y => <option key={y} value={y}>{y}</option>)}
+                          </select>
+                          <select value={buildMonth} onChange={(e) => setBuildMonth(e.target.value)} className={`bg-white border p-2 rounded-xl text-xs font-bold transition-all focus:ring-2 focus:ring-slate-900 ${examValidationError ? 'border-rose-400 bg-rose-50/10' : 'border-slate-200'}`}>
+                            <option value="">Month...</option>
+                            {allMonths.map(m => <option key={m} value={m}>{m}</option>)}
                           </select>
                         </div>
-                        <button type="submit" disabled={isSaving} className="w-full bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold py-2 rounded-xl cursor-pointer">
-                          Publish Session
-                        </button>
+                        {!isExamFormIncomplete && <div className="text-[11px] text-slate-500 font-medium animate-in fade-in duration-200 px-0.5">Preview: <span className="font-bold text-indigo-600">{`${buildType} ${buildYear} ${buildMonth}`}</span></div>}
+                        <button type="submit" disabled={isSaving || isExamFormIncomplete || !!examValidationError} className="w-full h-10 bg-slate-900 text-white text-xs font-bold uppercase tracking-wider rounded-xl disabled:bg-slate-300 active:scale-[0.99] transition-all flex items-center justify-center">Add Session</button>
                       </form>
 
-                      {/* Form B: EXPLICIT SIDE-BUTTON INFLUX STAGING FORM */}
-                      <form onSubmit={handleDeployStagedRoster} className="bg-white border border-slate-200 rounded-2xl p-4 space-y-4 shadow-xs">
-                        <div className="flex justify-between items-center">
-                          <h4 className="text-xs font-black uppercase text-slate-400 tracking-wider">Staging Roster Builder</h4>
-                          {pendingStudents.length > 0 && (
-                            <span className="text-[10px] font-bold bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-md">
-                              {pendingStudents.length} Staged
-                            </span>
-                          )}
-                        </div>
-                        
-                        <div className="space-y-3">
-                          {/* Input field connected to a small explicit plus button */}
-                          <div className="flex gap-1.5">
-                            <input 
-                              type="text" 
-                              placeholder="Enter student full name" 
-                              value={studentInput}
-                              onChange={(e) => setStudentInput(e.target.value)}
-                              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addStudentToQueue(); } }}
-                              className="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs focus:outline-none focus:bg-white focus:ring-2 focus:ring-indigo-500 transition-all" 
-                            />
-                            <button 
-                              type="button" 
-                              onClick={addStudentToQueue}
-                              className="bg-slate-900 hover:bg-slate-800 text-white text-sm font-black px-3.5 rounded-xl transition-all cursor-pointer flex items-center justify-center"
-                              title="Add student to current staging list"
-                            >
-                              +
-                            </button>
+                      <form onSubmit={handleDeployRoster} className="border rounded-2xl p-4 space-y-3">
+                        <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider block">Register Candidate(s)</span>
+                        <div className="space-y-1.5">
+                          {studentValidationError && <div className="text-rose-500 text-[11px] font-medium px-1 transition-all">{studentValidationError}</div>}
+                          <div className="flex gap-2">
+                            <input type="text" placeholder="Enter Candidate Fullname" value={studentInput} onChange={(e) => setStudentInput(e.target.value)} className={`flex-1 bg-slate-50 border p-2 rounded-xl text-xs transition-all focus:bg-white focus:ring-2 ${studentValidationError ? 'border-rose-400 focus:ring-rose-100 bg-rose-50/10 text-rose-900' : 'border-slate-200 focus:ring-slate-900'}`} />
+                            <button type="button" onClick={addStudentToQueue} disabled={!!studentValidationError || !studentInput.trim()} className="bg-slate-100 disabled:opacity-50 px-3 rounded-xl font-black transition-all">+</button>
                           </div>
-
-                          {/* DYNAMIC LIST MATRIX: Displays staged candidates with top-right action trigger */}
-                          {pendingStudents.length > 0 && (
-                            <div className="space-y-1.5 max-h-36 overflow-y-auto p-1.5 bg-slate-50/50 border border-slate-100 rounded-xl">
-                              {pendingStudents.map((name, index) => (
-                                <div key={index} className="relative flex justify-between items-center bg-white border border-slate-200/60 px-3 py-2 rounded-lg pr-8 shadow-2xs">
-                                  <span className="text-xs font-semibold text-slate-700 truncate uppercase tracking-tight">{name}</span>
-                                  <button 
-                                    type="button" 
-                                    onClick={() => removePendingStudent(index)}
-                                    className="absolute top-1.5 right-2 text-slate-300 hover:text-rose-600 font-bold transition-colors cursor-pointer text-sm leading-none"
-                                    title="Remove candidate from staging list"
-                                  >
-                                    ×
-                                  </button>
-                                </div>
-                              ))}
-                            </div>
-                          )}
                         </div>
-
-                        <select required value={targetExamId} onChange={(e) => setTargetExamId(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs focus:outline-none text-slate-600 font-semibold">
-                          <option value="">-- Select Target Exam Session --</option>
-                          {allExams.map(e => <option key={e.id} value={e.id}>[{e.level}] {e.name}</option>)}
+                        {pendingStudents.length > 0 && <div className="text-xs text-slate-500 font-medium px-0.5">{pendingStudents.length} {pendingStudents.length === 1 ? 'candidate' : 'candidates'} in queue...</div>}
+                        <select required value={targetExamId} onChange={(e) => setTargetExamId(e.target.value)} className="w-full bg-slate-50 border p-2 rounded-xl text-xs font-bold">
+                          <option value="">-- Select Target Session --</option>
+                          {allExams.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
                         </select>
-                        <button type="submit" disabled={isSaving || pendingStudents.length === 0} className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed text-white text-xs font-bold py-2 rounded-xl cursor-pointer transition-all">
-                          Inject Staged List to Exam
-                    </button>
+                        <button type="submit" disabled={!!studentValidationError || !targetExamId} className="w-full h-10 bg-slate-900 text-white text-xs font-bold uppercase tracking-wider rounded-xl disabled:bg-slate-300 active:scale-[0.99] transition-all flex items-center justify-center">Register Candidates</button>
                       </form>
                     </div>
                   )}
 
-                  {/* Active Pool Sheet */}
                   <section>
-                    <h2 className="text-xs font-black text-slate-400 uppercase tracking-wider mb-3">Active Institutional Exam Pool</h2>
-                    <div className="space-y-2.5">
-                      {allExams.map((exam) => (
-                        <button key={exam.id} onClick={() => setSelectedExamId(String(exam.id))} className="w-full text-left bg-white border border-slate-200 rounded-2xl p-4 transition-all flex justify-between items-center group shadow-xs hover:border-indigo-500 hover:shadow-md cursor-pointer">
-                          <div>
-                            <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 text-slate-600 mr-2">{exam.level}</span>
-                            <span className="font-semibold text-sm text-slate-900 group-hover:text-indigo-600">{exam.name}</span>
+                    <h2 className="text-xs font-black text-slate-400 uppercase tracking-wider mb-3">Active Sessions</h2>
+                    <div className="space-y-2">
+                      {allExams.length === 0 ? (
+                        <p className="text-xs text-slate-400 font-medium italic text-center py-6 bg-slate-50/50 rounded-2xl border border-dashed border-slate-200">No active assessment sessions found.</p>
+                      ) : (
+                        allExams.map((exam) => (
+                          <div key={exam.id} onClick={() => { setSelectedExamId(String(exam.id)); router.push(`/?examId=${exam.id}`); }} className="bg-white border rounded-2xl p-4 flex justify-between items-center hover:border-slate-900 cursor-pointer shadow-xs transition-all duration-150">
+                            <span className="font-bold text-sm uppercase text-slate-900">{exam.name}</span>
+                            {currentProfile?.role === 'admin' && (
+                              <button onClick={(e) => { e.stopPropagation(); setDeleteTarget({ type: 'exam', id: exam.id, name: exam.name }); }} className="text-slate-300 hover:text-rose-600 p-1 rounded-lg hover:bg-rose-50 transition-colors">🗑️</button>
+                            )}
                           </div>
-                          <span className="text-slate-300 group-hover:text-indigo-500">→</span>
-                        </button>
-                      ))}
+                        ))
+                      )}
                     </div>
                   </section>
                 </div>
               ) : (
-                /* VIEWPORT 2: Granular Evaluation Sheet */
-                <div className="space-y-6">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <span className="text-[10px] font-bold bg-slate-900 text-white px-2 py-0.5 rounded-md uppercase">{currentExam?.level} Level</span>
-                      <h2 className="text-lg font-black text-slate-900 mt-1">{currentExam?.name}</h2>
-                    </div>
-                    {currentProfile?.role === 'admin' && (
-                      <button onClick={triggerPrint} className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold px-3 py-2 rounded-xl flex items-center gap-1.5 border border-indigo-100 cursor-pointer">
-                        🖨️ Print Attendance List
-                      </button>
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center border-b pb-2">
+                    <h2 className="text-base font-black uppercase text-slate-900">{currentExam?.name}</h2>
+                  </div>
+
+                  {/* Print Action Grid */}
+                  <div className="grid grid-cols-2 gap-2">
+                    <button onClick={printDoorList} disabled={activeStudents.length === 0} className="flex items-center justify-center gap-1.5 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 text-slate-700 text-[11px] font-bold py-2.5 rounded-xl transition-all active:scale-95 cursor-pointer border border-slate-200/40">🖨️ Print Door List</button>
+                    <button onClick={printAttendanceList} disabled={activeStudents.length === 0} className="flex items-center justify-center gap-1.5 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 text-slate-700 text-[11px] font-bold py-2.5 rounded-xl transition-all active:scale-95 cursor-pointer border border-slate-200/40">📝 Attendance Sheet</button>
+                  </div>
+
+                  <div className="space-y-3 pt-1">
+                    {activeStudents.length === 0 ? (
+                      <p className="text-xs text-slate-400 font-medium italic text-center py-6 bg-slate-50/50 rounded-2xl border border-dashed border-slate-200">
+                        No candidates currently registered in this session.
+                      </p>
+                    ) : (
+                      // Doğru Kullanım: Buradaki fazladan { kaldırıldı
+                      activeStudents.map((student) => {
+                        // Badge renklerini duruma göre dinamik belirleyen yardımcı nesne
+                        const statusBadges = {
+                          'Pending': 'bg-slate-100 text-slate-600 border border-slate-200',
+                          'Partly Graded': 'bg-amber-500/10 text-amber-600 border border-amber-500/20',
+                          'Fully Graded': 'bg-emerald-500/10 text-emerald-600 border border-emerald-500/20',
+                        };
+
+                        // Duruma göre buton etiketini belirleyen kural seti
+                        const getButtonLabel = (status: string) => {
+                          if (status === 'Partly Graded') return 'Continue Grading →';
+                          if (status === 'Fully Graded') return 'Re-edit Completed Grading ⚙️';
+                          return 'Start Grading →';
+                        };
+
+                        // Öğrencinin nihai raporunu yazdıran tetikleyici fonksiyon
+                        const printFinalReport = async (studentItem: any) => {
+                          // Rapor çıktısı için gerekli ham bilgileri anlık olarak hesaplama motoruna gönderiyoruz
+                          const mockInput: StudentExamInput = {
+                            examType: (currentExam?.name.split(' ')[0] || 'FCE') as ExamType,
+                            reading: studentItem.raw_scores?.reading || {},
+                            listening: studentItem.raw_scores?.listening || {},
+                            writing: studentItem.raw_scores?.writing || {},
+                            speaking: studentItem.raw_scores?.speaking || {},
+                            useOfEnglish: studentItem.raw_scores?.useOfEnglish || {}
+                          };
+
+                          // Calculator yardımıyla tam çıktı setini oluşturup yazdırıyoruz
+                          const { calculateOverallResults } = require('@/lib/examEngine/calculator');
+                          const computedResults = calculateOverallResults(mockInput);
+
+                          const html = generateFinalReportHTML(studentItem.name, currentExam?.name || 'Exam', computedResults);
+                          executePrint(html);
+                        };
+
+                        return (
+                          <div key={student.id} className="bg-white border rounded-2xl p-4 shadow-xs space-y-4 transition-all duration-200 hover:shadow-md">
+                            <div className="flex justify-between items-start">
+                              <div>
+                                <span className="font-black text-sm uppercase text-slate-900 block tracking-tight">{student.name}</span>
+                                {/* Dinamik Durum Badge Alanı */}
+                                <span className={`inline-block text-[9px] font-bold px-2 py-0.5 rounded-md mt-1.5 uppercase ${statusBadges[student.status as keyof typeof statusBadges] || 'bg-slate-100'}`}>
+                                  {student.status || 'Pending'}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                {currentProfile?.role === 'admin' && (
+                                  <>
+                                    <button onClick={() => toggleAttendance(student.id, student.status)} className="text-[10px] font-bold border border-slate-200 px-2 py-1 rounded-lg bg-slate-50 hover:bg-white transition-colors">
+                                      {student.status === 'Absent' ? 'Mark Present' : 'Mark Absent'}
+                                    </button>
+                                    <button onClick={() => setDeleteTarget({ type: 'student', id: student.id, name: student.name })} className="text-slate-300 hover:text-rose-600 p-1 rounded-lg hover:bg-rose-50 transition-colors text-sm">🗑️</button>
+                                  </>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* ÖĞRETMEN AKSİYON ALANI */}
+                            {currentProfile?.role !== 'admin' && student.status !== 'Absent' && (
+                              <div className="space-y-2 pt-1">
+
+                                {/* ŞART: Eğer öğrenci tamamen puanlanmışsa "Take Final Report" butonunu en üstte göster */}
+                                {student.status === 'Fully Graded' && (
+                                  <button
+                                    onClick={() => printFinalReport(student)}
+                                    className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white text-xs font-black py-2.5 rounded-xl transition-all shadow-md active:scale-95 flex items-center justify-center gap-1.5 cursor-pointer animate-in fade-in slide-in-from-top-2 duration-300"
+                                  >
+                                    🎓 Take Final Report (PDF)
+                                  </button>
+                                )}
+
+                                {/* KESİN ÇÖZÜM: Yönlendirme URL'inin sonuna &examId=${selectedExamId} eklendi */}
+                                <button
+                                  onClick={() => {
+                                    const inferredType = currentExam?.name.split(' ')[0] || 'FCE';
+                                    router.push(`/assessment?studentId=${student.id}&studentName=${encodeURIComponent(student.name)}&examType=${inferredType}&examId=${selectedExamId}`);
+                                  }}
+                                  className={`w-full text-xs font-bold py-2.5 rounded-xl transition-all shadow-xs flex items-center justify-center gap-1 cursor-pointer ${student.status === 'Fully Graded'
+                                    ? 'bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300/40'
+                                    : student.status === 'Partly Graded'
+                                      ? 'bg-indigo-600 hover:bg-indigo-700 text-white font-black'
+                                      : 'bg-slate-900 hover:bg-slate-800 text-white font-black'
+                                    }`}
+                                >
+                                  {getButtonLabel(student.status)}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      }) // Doğru Kullanım: Kapanıştaki fazladan } kaldırıldı
                     )}
                   </div>
-
-                  {/* Operational Metrics Panel */}
-                  <div className="bg-slate-900 text-white rounded-2xl p-4 shadow-md grid grid-cols-2 text-center">
-                    <div className="border-r border-slate-800">
-                      <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">Registered Students</p>
-                      <p className="text-xl font-black text-indigo-400 mt-0.5">{totalStudents}</p>
-                    </div>
-                    <div>
-                      <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">Graded</p>
-                      <p className="text-xl font-black text-emerald-400 mt-0.5">{gradedCount} <span className="text-xs text-slate-500">candidates</span></p>
-                    </div>
-                  </div>
-
-                  {/* Student Assessment List Matrix */}
-                  <section className="space-y-3.5">
-                    {activeStudents.map((student) => (
-                      <div key={student.id} className="bg-white border border-slate-100 rounded-2xl p-4 shadow-xs flex flex-col gap-3">
-                        <div className="flex justify-between items-center">
-                          <span className="font-bold text-sm text-slate-800 uppercase tracking-tight">{student.name}</span>
-                          <span className={`text-[9px] font-black px-2 py-0.5 rounded-md uppercase ${student.status === 'Graded' ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>{student.status}</span>
-                        </div>
-                        
-                        <div className="grid grid-cols-2 gap-3">
-                          {currentProfile?.role === 'admin' ? (
-                            <>
-                              <div className="bg-slate-50 border border-slate-100 rounded-xl p-2 text-center">
-                                <span className="block text-[9px] font-bold text-slate-400 uppercase tracking-wider">Writing</span>
-                                <span className="text-sm font-black text-slate-700">{student.writing_score ?? '--'}</span>
-                              </div>
-                              <div className="bg-slate-50 border border-slate-100 rounded-xl p-2 text-center">
-                                <span className="block text-[9px] font-bold text-slate-400 uppercase tracking-wider">Speaking</span>
-                                <span className="text-sm font-black text-slate-700">{student.speaking_score ?? '--'}</span>
-                              </div>
-                            </>
-                          ) : (
-                            <>
-                              <div>
-                                <label className="block text-[9px] font-black text-slate-400 uppercase mb-1 tracking-wider">Writing (0-20)</label>
-                                <input type="text" placeholder="--" value={student.writing_score || ''} onChange={(e) => handleScoreChange(student.id, 'writing_score', e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-sm font-bold text-center focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white" />
-                              </div>
-                              <div>
-                                <label className="block text-[9px] font-black text-slate-400 uppercase mb-1 tracking-wider">Speaking (0-20)</label>
-                                <input type="text" placeholder="--" value={student.speaking_score || ''} onChange={(e) => handleScoreChange(student.id, 'speaking_score', e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-sm font-bold text-center focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white" />
-                              </div>
-                            </>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </section>
-
-                  {/* Save Matrix Button */}
-                  {currentProfile?.role !== 'admin' && (
-                    <button disabled={isSaving} onClick={handleSyncSession} className={`w-full py-3.5 rounded-xl font-black text-sm shadow-md transition-all text-center text-white ${isSaving ? 'bg-amber-500' : 'bg-indigo-600 hover:bg-indigo-700 cursor-pointer'}`}>
-                      {isSaving ? 'Syncing Cloud...' : 'Save Scores & Lock Session'}
-                    </button>
-                  )}
                 </div>
               )}
             </>
