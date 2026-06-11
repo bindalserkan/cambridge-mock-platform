@@ -16,6 +16,7 @@ interface Profile {
 interface Exam {
   id: number;
   name: string;
+  attendance_locked?: boolean;
 }
 
 interface Student {
@@ -196,7 +197,7 @@ export default function Home() {
         if (profileData) {
           setCurrentProfile(profileData as Profile);
           setAuthError(null);
-          const { data: exams } = await supabase.from('exams').select('id, name').order('id', { ascending: false });
+          const { data: exams } = await supabase.from('exams').select('id, name, attendance_locked').order('id', { ascending: false });
           if (exams) setAllExams(exams);
         } else {
           setAuthError('Profile record missing in cloud workspace ledger.');
@@ -244,7 +245,7 @@ export default function Home() {
     if (error) {
       showNotification(error.message, 'error');
     } else {
-      const { data: exams } = await supabase.from('exams').select('id, name').order('id', { ascending: false });
+      const { data: exams } = await supabase.from('exams').select('id, name, attendance_locked').order('id', { ascending: false });
       if (exams) setAllExams(exams);
       showNotification(`Session added successfully: ${concatenatedName}`);
       setBuildType('');
@@ -317,14 +318,65 @@ export default function Home() {
     setIsSaving(false);
   };
 
-  const toggleAttendance = async (studentId: string, currentStatus: string) => {
-    const nextStatus = currentStatus === 'Absent' ? 'Pending' : 'Absent';
-    const { error } = await supabase.from('students').update({ status: nextStatus }).eq('id', studentId);
-    if (!error) {
-      setActiveStudents(prev => prev.map(s => s.id === studentId ? { ...s, status: nextStatus as any } : s));
+  const markAttendance = async (studentId: string, newStatus: string) => {
+    const student = activeStudents.find(s => s.id === studentId);
+
+    if (student && (student.status === 'Partly Graded' || student.status === 'Fully Graded')) {
+      // Not: showNotification fonksiyonunu kullanırken nesne gönderme, sadece mesaj gönder.
+      return;
+    }
+
+    setActiveStudents(prev => prev.map(s => s.id === studentId ? { ...s, status: newStatus as any } : s));
+
+    const { error } = await supabase.from('students').update({ status: newStatus }).eq('id', studentId);
+
+    if (error) {
+      console.error("DEBUG - Supabase Error Object:", error);
+      console.error("DEBUG - Error Message:", error.message); // Hatanın asıl sebebi burada yazacak
+
+      setActiveStudents(prev => prev.map(s => s.id === studentId ? { ...s, status: student?.status as any } : s));
     }
   };
 
+  // 1. Tüm öğrencilerin yoklaması alındı mı?
+  const allAttendanceMarked = activeStudents.length > 0 &&
+    activeStudents.every(s => s.status === 'Present' || s.status === 'Absent');
+
+  // 2. Mevcut Attendance Sheet butonuna basılınca çalışacak yeni akış
+  const handleFinishAttendance = async () => {
+    if (!allAttendanceMarked) {
+      showNotification('Please mark all candidates as Present or Absent first.', 'error');
+      return;
+    }
+
+    // 1. Yazdırma
+    printAttendanceList();
+
+    // 2. Veritabanını güncelle
+    const { error } = await supabase
+      .from('exams')
+      .update({ attendance_locked: true })
+      .eq('id', Number(selectedExamId));
+
+    if (error) {
+      showNotification('Error saving attendance: ' + error.message, 'error');
+      return;
+    }
+
+    // 3. KRİTİK ADIM: Sadece state'i elle güncelleme, veriyi veritabanından tekrar çek
+    // Bu sayede tüm sınavlar (ve attendance_locked durumu) senkronize olur.
+    const { data: exams, error: fetchError } = await supabase
+      .from('exams')
+      .select('id, name, attendance_locked')
+      .order('id', { ascending: false });
+
+    if (exams) {
+      setAllExams(exams);
+      showNotification('Attendance sheet saved and locked!', 'success');
+    } else {
+      showNotification('Attendance locked, but failed to refresh data.', 'error');
+    }
+  };
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (emailValidationError) return;
@@ -506,7 +558,13 @@ export default function Home() {
                   {/* Print Action Grid */}
                   <div className="grid grid-cols-2 gap-2">
                     <button onClick={printDoorList} disabled={activeStudents.length === 0} className="flex items-center justify-center gap-1.5 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 text-slate-700 text-[11px] font-bold py-2.5 rounded-xl transition-all active:scale-95 cursor-pointer border border-slate-200/40">🖨️ Print Door List</button>
-                    <button onClick={printAttendanceList} disabled={activeStudents.length === 0} className="flex items-center justify-center gap-1.5 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 text-slate-700 text-[11px] font-bold py-2.5 rounded-xl transition-all active:scale-95 cursor-pointer border border-slate-200/40">📝 Attendance Sheet</button>
+                    <button
+                      onClick={handleFinishAttendance}
+                      disabled={!allAttendanceMarked || currentExam?.attendance_locked}
+                      className="flex items-center justify-center gap-1.5 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 text-slate-700 text-[11px] font-bold py-2.5 rounded-xl transition-all active:scale-95 cursor-pointer border border-slate-200/40"
+                    >
+                      📝 Attendance Sheet
+                    </button>
                   </div>
 
                   <div className="space-y-3 pt-1">
@@ -515,25 +573,30 @@ export default function Home() {
                         No candidates currently registered in this session.
                       </p>
                     ) : (
-                      // Doğru Kullanım: Buradaki fazladan { kaldırıldı
                       activeStudents.map((student) => {
-                        // Badge renklerini duruma göre dinamik belirleyen yardımcı nesne
+                        // 1. New 5-State Status Badges
                         const statusBadges = {
-                          'Pending': 'bg-slate-100 text-slate-600 border border-slate-200',
-                          'Partly Graded': 'bg-amber-500/10 text-amber-600 border border-amber-500/20',
-                          'Fully Graded': 'bg-emerald-500/10 text-emerald-600 border border-emerald-500/20',
+                          'Pending': 'bg-slate-100 text-slate-500 border border-slate-200',
+                          'Absent': 'bg-rose-50 text-rose-600 border border-rose-200',
+                          'Present': 'bg-blue-50 text-blue-600 border border-blue-200',
+                          'Partly Graded': 'bg-amber-50 text-amber-600 border border-amber-200',
+                          'Fully Graded': 'bg-emerald-50 text-emerald-600 border border-emerald-200',
                         };
 
-                        // Duruma göre buton etiketini belirleyen kural seti
+                        // 2. Rule set to determine button label based on status
                         const getButtonLabel = (status: string) => {
                           if (status === 'Partly Graded') return 'Continue Grading →';
                           if (status === 'Fully Graded') return 'Re-edit Completed Grading ⚙️';
                           return 'Start Grading →';
                         };
 
-                        // Öğrencinin nihai raporunu yazdıran tetikleyici fonksiyon
+                        // Logical locks
+                        const isGraded = student.status === 'Partly Graded' || student.status === 'Fully Graded';
+                        // ADMIN DELETE LOCK: Only allowed if status is strictly 'Pending'
+                        const canDelete = !student.status || student.status === 'Pending';
+
+                        // Trigger function to print the student's final report
                         const printFinalReport = async (studentItem: any) => {
-                          // Rapor çıktısı için gerekli ham bilgileri anlık olarak hesaplama motoruna gönderiyoruz
                           const mockInput: StudentExamInput = {
                             examType: (currentExam?.name.split(' ')[0] || 'FCE') as ExamType,
                             reading: studentItem.raw_scores?.reading || {},
@@ -543,70 +606,112 @@ export default function Home() {
                             useOfEnglish: studentItem.raw_scores?.useOfEnglish || {}
                           };
 
-                          // Calculator yardımıyla tam çıktı setini oluşturup yazdırıyoruz
                           const { calculateOverallResults } = require('@/lib/examEngine/calculator');
                           const computedResults = calculateOverallResults(mockInput);
-
                           const html = generateFinalReportHTML(studentItem.name, currentExam?.name || 'Exam', computedResults);
                           executePrint(html);
                         };
 
                         return (
-                          <div key={student.id} className="bg-white border rounded-2xl p-4 shadow-xs space-y-4 transition-all duration-200 hover:shadow-md">
-                            <div className="flex justify-between items-start">
-                              <div>
+                          <div key={student.id} className="bg-white border rounded-2xl p-4 shadow-xs transition-all duration-200 hover:shadow-md">
+
+                            {/* HEADER ROW */}
+                            <div className="flex justify-between items-center">
+
+                              {/* LEFT SIDE: Name & Badge */}
+                              <div className="flex flex-col items-start">
                                 <span className="font-black text-sm uppercase text-slate-900 block tracking-tight">{student.name}</span>
-                                {/* Dinamik Durum Badge Alanı */}
-                                <span className={`inline-block text-[9px] font-bold px-2 py-0.5 rounded-md mt-1.5 uppercase ${statusBadges[student.status as keyof typeof statusBadges] || 'bg-slate-100'}`}>
-                                  {student.status || 'Pending'}
-                                </span>
+
+                                {/* FIX 1: Pending, Partly Graded veya Fully Graded ise badge göster, Present/Absent ise GİZLE */}
+                                {(!student.status || student.status === 'Pending' || student.status === 'Partly Graded' || student.status === 'Fully Graded') && (
+                                  <span className={`inline-block text-[9px] font-bold px-2 py-0.5 rounded-md mt-1 uppercase ${(!student.status || student.status === 'Pending') ? 'bg-slate-100 text-slate-500 border border-slate-200' :
+                                    statusBadges[student.status as keyof typeof statusBadges]
+                                    }`}>
+                                    {(!student.status || student.status === 'Pending') ? 'Pending' : student.status}
+                                  </span>
+                                )}
                               </div>
-                              <div className="flex items-center gap-1.5">
+
+                              {/* RIGHT SIDE CONTROLS */}
+                              <div className="flex items-center gap-2">
+
+                                {/* FIX 2: Sadece sınav kilitli DEĞİLSE ve öğrenci henüz notlanmaya başlanmadıysa (Present/Absent seçimi aşamasındaysa) göster */}
+                                {currentExam && !currentExam.attendance_locked && !isGraded && (
+                                  <div className="w-[120px] flex justify-end">
+                                    <div className="flex bg-slate-100/70 p-0.5 rounded-lg border border-slate-200/60 w-full">
+                                      <button
+                                        type="button"
+                                        onClick={(e) => { e.preventDefault(); markAttendance(student.id, 'Present'); }}
+                                        className={`flex-1 text-[10px] font-bold px-1 py-1 rounded-md transition-all ${student.status === 'Present' ? 'bg-white shadow-sm text-blue-600 border border-slate-200/50' : 'text-slate-400 hover:text-slate-600'}`}
+                                      >Present</button>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => { e.preventDefault(); markAttendance(student.id, 'Absent'); }}
+                                        className={`flex-1 text-[10px] font-bold px-1 py-1 rounded-md transition-all ${student.status === 'Absent' ? 'bg-white shadow-sm text-rose-600 border border-slate-200/50' : 'text-slate-400 hover:text-slate-600'}`}
+                                      >Absent</button>
+                                    </div>
+                                  </div>
+                                )}
+
+                                {/* SLOT 2: ADMIN DELETE BUTTON */}
                                 {currentProfile?.role === 'admin' && (
-                                  <>
-                                    <button onClick={() => toggleAttendance(student.id, student.status)} className="text-[10px] font-bold border border-slate-200 px-2 py-1 rounded-lg bg-slate-50 hover:bg-white transition-colors">
-                                      {student.status === 'Absent' ? 'Mark Present' : 'Mark Absent'}
-                                    </button>
-                                    <button onClick={() => setDeleteTarget({ type: 'student', id: student.id, name: student.name })} className="text-slate-300 hover:text-rose-600 p-1 rounded-lg hover:bg-rose-50 transition-colors text-sm">🗑️</button>
-                                  </>
+                                  <div className="w-8 flex justify-center">
+                                    {canDelete && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => { e.preventDefault(); setDeleteTarget({ type: 'student', id: student.id, name: student.name }); }}
+                                        className="text-slate-300 hover:text-rose-600 p-1.5 rounded-lg hover:bg-rose-50 transition-colors text-sm"
+                                      >🗑️</button>
+                                    )}
+                                  </div>
                                 )}
                               </div>
                             </div>
 
-                            {/* ÖĞRETMEN AKSİYON ALANI */}
-                            {currentProfile?.role !== 'admin' && student.status !== 'Absent' && (
-                              <div className="space-y-2 pt-1">
+                            {/* TEACHER ACTION AREA */}
+                            {currentProfile?.role !== 'admin' && (
+                              <div className="space-y-2 pt-3 mt-3 border-t border-slate-50">
 
-                                {/* ŞART: Eğer öğrenci tamamen puanlanmışsa "Take Final Report" butonunu en üstte göster */}
-                                {student.status === 'Fully Graded' && (
-                                  <button
-                                    onClick={() => printFinalReport(student)}
-                                    className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white text-xs font-black py-2.5 rounded-xl transition-all shadow-md active:scale-95 flex items-center justify-center gap-1.5 cursor-pointer animate-in fade-in slide-in-from-top-2 duration-300"
-                                  >
-                                    🎓 Take Final Report (PDF)
-                                  </button>
+                                {/* Bilgilendirme metni */}
+                                {currentExam && !currentExam.attendance_locked && !isGraded && (
+                                  <p className="text-[11px] text-slate-400 font-medium italic text-center py-1">
+                                    Mark attendance to proceed.
+                                  </p>
                                 )}
 
-                                {/* KESİN ÇÖZÜM: Yönlendirme URL'inin sonuna &examId=${selectedExamId} eklendi */}
-                                <button
-                                  onClick={() => {
-                                    const inferredType = currentExam?.name.split(' ')[0] || 'FCE';
-                                    router.push(`/assessment?studentId=${student.id}&studentName=${encodeURIComponent(student.name)}&examType=${inferredType}&examId=${selectedExamId}`);
-                                  }}
-                                  className={`w-full text-xs font-bold py-2.5 rounded-xl transition-all shadow-xs flex items-center justify-center gap-1 cursor-pointer ${student.status === 'Fully Graded'
-                                    ? 'bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300/40'
-                                    : student.status === 'Partly Graded'
-                                      ? 'bg-indigo-600 hover:bg-indigo-700 text-white font-black'
-                                      : 'bg-slate-900 hover:bg-slate-800 text-white font-black'
-                                    }`}
-                                >
-                                  {getButtonLabel(student.status)}
-                                </button>
+                                {/* Puanlama butonları */}
+                                {(currentExam?.attendance_locked || isGraded || student.status === 'Present') && (
+                                  <>
+                                    {student.status === 'Fully Graded' && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => { e.preventDefault(); printFinalReport(student); }}
+                                        className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white text-xs font-black py-2.5 rounded-xl transition-all shadow-md active:scale-95 flex items-center justify-center gap-1.5"
+                                      >🎓 Take Final Report (PDF)</button>
+                                    )}
+
+                                    {(student.status === 'Present' || isGraded) && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.preventDefault();
+                                          const inferredType = currentExam?.name.split(' ')[0] || 'FCE';
+                                          router.push(`/assessment?studentId=${student.id}&studentName=${encodeURIComponent(student.name)}&examType=${inferredType}&examId=${selectedExamId}`);
+                                        }}
+                                        className={`w-full text-xs font-bold py-2.5 rounded-xl transition-all shadow-xs flex items-center justify-center gap-1 ${student.status === 'Fully Graded' ? 'bg-slate-100 hover:bg-slate-200 text-slate-700' :
+                                          student.status === 'Partly Graded' ? 'bg-indigo-600 hover:bg-indigo-700 text-white' : 'bg-slate-900 hover:bg-slate-800 text-white'
+                                          }`}
+                                      >
+                                        {getButtonLabel(student.status)}
+                                      </button>
+                                    )}
+                                  </>
+                                )}
                               </div>
                             )}
                           </div>
                         );
-                      }) // Doğru Kullanım: Kapanıştaki fazladan } kaldırıldı
+                      })
                     )}
                   </div>
                 </div>
